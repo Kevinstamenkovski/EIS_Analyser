@@ -1,8 +1,12 @@
 import pandas as pd
 from pprint import pprint
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+import numpy as np
+
+from hybdrt.models import DRT
+from hybdrt import plotting as hplt
 
 
 def file_read():
@@ -73,18 +77,54 @@ def access_data(result, section_name, resistivity):
     return None
 
 
-def generate_nyquist_graph(ax, data):
-    ax.plot(data["Z'"], data["-Z''"])
-    ax.set_title("Nyquist Plot")
-    ax.set_xlabel("Z'")
-    ax.set_ylabel("-Z''")
+def prepare_eis_arrays(data):
+    freq = np.array(data["Frequency"], dtype=float)
+    z_real = np.array(data["Z'"], dtype=float)
+    neg_z_imag = np.array(data["-Z''"], dtype=float)
+
+    # keep only valid points
+    mask = np.isfinite(freq) & np.isfinite(z_real) & np.isfinite(neg_z_imag)
+    freq = freq[mask]
+    z_real = z_real[mask]
+    neg_z_imag = neg_z_imag[mask]
+
+    # optional: keep only positive frequencies
+    mask = freq > 0
+    freq = freq[mask]
+    z_real = z_real[mask]
+    neg_z_imag = neg_z_imag[mask]
+
+    # hybdrt expects complex impedance: Z = Z' + jZ''
+    # your sheet stores -Z'', so actual imag part is negative of that column
+    z = z_real - 1j * neg_z_imag
+
+    return freq, z
 
 
-def generate_bode_graph(ax, data):
-    ax.plot(data["Frequency"], data["Z"])
-    ax.set_title("Bode Plot")
-    ax.set_xlabel("Frequency")
-    ax.set_ylabel("Z")
+def run_drt(data, title="EIS + DRT"):
+    freq, z = prepare_eis_arrays(data)
+
+    print("Points used:", len(freq))
+    print("Freq min/max:", freq.min(), freq.max())
+
+    # raw EIS plot
+    plt.figure(figsize=(6, 5))
+    hplt.plot_eis((freq, z))
+    plt.title(f"{title} - Raw EIS")
+    plt.tight_layout()
+    plt.show()
+
+    # DRT fit
+    drt = DRT()
+    drt.fit_eis(freq, z, lambda_0=1)
+
+    # DRT result plot
+    drt.plot_results()
+    plt.suptitle(f"{title} - DRT Fit")
+    plt.tight_layout()
+    plt.show()
+
+    return drt
 
 
 def main():
@@ -101,20 +141,19 @@ def main():
             print(f"Res: {res}, Mat: {mat}")
             continue
 
-        pprint(data)
-
         if data is None:
             print("No matching data found.")
             continue
 
-        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        pprint(data)
 
-        generate_nyquist_graph(ax[0], data)
-        generate_bode_graph(ax[1], data)
+        title = f"{mat} | {float(res)} A/cm2"
 
-        plt.tight_layout()
-        plt.show()
-        plt.close(fig)
+        try:
+            run_drt(data, title=title)
+        except Exception as e:
+            print("DRT fit failed:")
+            print(e)
 
 
 main()

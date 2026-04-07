@@ -3,6 +3,8 @@ from pprint import pprint
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+from impedance.visualization import plot_nyquist
+from impedance.models.circuits import CustomCircuit
 
 
 def file_read():
@@ -102,23 +104,46 @@ def main():
 
     data = access_data(result, "EOC", 0.07)
 
-    pprint(data)
+    #pprint(data)
 
     # if data is None:
     #     print("No matching data found.")
     #     continue
 
-    fig, ax = plt.subplots(1, 1, figsize=(12, 5))  # ncols change back to 2 for Bode
+###########################################################################
+    circuit = 'L0-R0-p(R1,CPE1)-p(R2,CPE2)'
 
-    generate_nyquist_graph(ax, data)    #ax back to ax[0]
-    # generate_bode_graph(ax[1], data)
+    ##
+    # L0 ->>> L0     ````   starting number: 0.005 _}}
+    # R0 ->>> L0-R0     `````  Starting number: 100
+    # p(R1,C1) _>>>> L0-R0-p(R1,C1)
+    ##
+    initial_guess = [0.0001, .01, .01, 10, .1, 1, 1, .1]
 
+    circuit = CustomCircuit(circuit, initial_guess=initial_guess)
+
+    circuit.fit(data["Frequency"], data["Z"])
+
+    pprint(circuit.parameters_)
+    print(circuit)  # this is the holy grail of our code
+
+    Z_fit = circuit.predict(data["Frequency"])
+
+
+###########################################################################
+
+    fig, ax = plt.subplots()
+
+    generate_nyquist_graph(ax, data)
+
+    print("#################################")
+
+    plot_nyquist(Z_fit, fmt='-', scale=10, ax=ax)
+
+    plt.legend(["Data", "Fit"])
     plt.tight_layout()
     plt.show()
     plt.close(fig)
 
 
 main()
-
-#   SELECT OPTION FOR INTERVAL (study certain points)
-#

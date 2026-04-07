@@ -1,12 +1,14 @@
 import pandas as pd
 from pprint import pprint
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+import customtkinter as ctk
+from tkinter import filedialog
 
 
-def file_read():
-    df = pd.read_excel("EIS_data_DRT.xlsx", sheet_name=0, header=None)
+def file_read(filepath):
+    df = pd.read_excel(filepath, sheet_name=0, header=None)
 
     result = {}
     rows, cols = df.shape
@@ -27,7 +29,11 @@ def file_read():
             continue
 
         section = str(section_raw).strip()
-        res = float(str(res_raw).replace("A/cm2", "").strip())
+
+        try:
+            res = float(str(res_raw).replace("A/cm2", "").strip())
+        except ValueError:
+            continue
 
         j = 3
         data_rows = []
@@ -78,6 +84,7 @@ def generate_nyquist_graph(ax, data):
     ax.set_title("Nyquist Plot")
     ax.set_xlabel("Z'")
     ax.set_ylabel("-Z''")
+    ax.grid(True)
 
 
 def generate_bode_graph(ax, data):
@@ -85,40 +92,61 @@ def generate_bode_graph(ax, data):
     ax.set_title("Bode Plot")
     ax.set_xlabel("Frequency")
     ax.set_ylabel("Z")
+    ax.grid(True)
 
 
-def main():
-    result = file_read()
-
-    # mat = input("What EOC material it is: ").strip()
-    # res = input("What resistivity is it: ").strip()
-
-    # try:
-    #     data = access_data(result, mat, float(res))
-    # except ValueError:
-    #     print("Resistivity HAS TO BE FLOAT!")
-    #     print(f"Res: {res}, Mat: {mat}")
-
+def process_file(filepath):
+    result = file_read(filepath)
 
     data = access_data(result, "EOC", 0.07)
 
     pprint(data)
 
-    # if data is None:
-    #     print("No matching data found.")
-    #     continue
+    if data is None:
+        print("No matching data found.")
+        return
 
-    fig, ax = plt.subplots(1, 1, figsize=(12, 5))  # ncols change back to 2 for Bode
-
-    generate_nyquist_graph(ax, data)    #ax back to ax[0]
-    # generate_bode_graph(ax[1], data)
+    fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+    generate_nyquist_graph(ax, data)
+    # generate_bode_graph(ax, data)
 
     plt.tight_layout()
     plt.show()
     plt.close(fig)
 
 
-main()
+def select_file():
+    filepath = filedialog.askopenfilename(
+        title="Select Excel File",
+        filetypes=[("Excel files", "*.xlsx *.xls")]
+    )
 
-#   SELECT OPTION FOR INTERVAL (study certain points)
-#
+    if filepath:
+        process_file(filepath)
+
+
+def create_ui():
+    ctk.set_appearance_mode("System")
+    ctk.set_default_color_theme("blue")
+
+    app = ctk.CTk()
+    app.title("EIS File Loader")
+    app.geometry("1200x800")
+
+    button = ctk.CTkButton(
+        app,
+        text="Select Excel File",
+        command=select_file
+    )
+    button.pack(expand=True)
+
+    return app
+
+
+def main():
+    app = create_ui()
+    app.mainloop()
+
+
+# if __name__ == "__main__":
+main()

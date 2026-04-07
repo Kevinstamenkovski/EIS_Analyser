@@ -1,3 +1,4 @@
+import customtkinter
 import pandas as pd
 from pprint import pprint
 import matplotlib
@@ -133,13 +134,61 @@ def create_ui():
     app.title("EIS File Loader")
     app.geometry("1200x800")
 
-    button = ctk.CTkButton(
-        app,
+    margin = 0.01
+    gap = 0.02
+    usable_width = 1 - (2 * margin)
+    usable_height = 1 - (2 * margin) - gap
+
+    top_height = usable_height * (3 / 4)
+    bottom_height = usable_height * (1 / 4)
+
+
+    app_frame = ctk.CTkFrame(master=app, fg_color="#0F0")
+    app_frame.grid_rowconfigure(0, weight=1)
+    app_frame.grid_columnconfigure(0, weight=1)  # 1/4
+    app_frame.grid_columnconfigure(1, weight=3)  # 3/4
+
+
+    user_input_frame = ctk.CTkScrollableFrame(master=app_frame, fg_color="#F00")
+    user_output_frame = ctk.CTkFrame(master=app_frame, fg_color="#0FF")
+    control_frame = ctk.CTkFrame(master=app, fg_color="#00F")
+
+    selection_button = ctk.CTkButton(
+        master=control_frame,
         text="Select Excel File",
         command=select_file
     )
-    button.pack(expand=True)
 
+    app_frame.place(
+        relx=margin,
+        rely=margin,
+        relwidth=usable_width,
+        relheight=top_height
+    )
+
+    control_frame.place(
+        relx=margin,
+        rely=margin + top_height + gap,
+        relwidth=usable_width,
+        relheight=bottom_height
+    )
+
+    user_input_frame.grid(
+        row=0,
+        column=0,
+        sticky="nsew",
+        padx=(10, 5),
+        pady=10
+    )
+    user_output_frame.grid(
+        row=0,
+        column=1,
+        sticky="nsew",
+        padx=(5, 10),
+        pady=10
+    )
+
+    selection_button.pack(expand=True)
     return app
 
 

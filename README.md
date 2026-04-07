@@ -83,3 +83,6 @@ L0-R0-p(R1,CPE1)-p(R2,CPE2)
 - Fitted parameters
 - Nyquist plot with measured data and fitted curve
 - Exportable Excel output with fit data
+
+
+#### NEXT STEP, WE DO IT IN MATLAB

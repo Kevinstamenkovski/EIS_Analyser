@@ -1,12 +1,18 @@
 import re
-import customtkinter as ctk
+import numpy as np
 import pandas as pd
+import customtkinter as ctk
 import matplotlib
+
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+
 from tkinter import filedialog
-from impedance.visualization import plot_nyquist
 from impedance.models.circuits import CustomCircuit
+
+
+ALL_MATERIALS = "__ALL_MATERIALS__"
+ALL_RESISTIVITIES = "__ALL_RESISTIVITIES__"
 
 
 class StepFSM:
@@ -20,16 +26,28 @@ class StepFSM:
             "get_circuit": ["select_data"],
             "get_init_vals": ["get_circuit"],
             "fit_graph": ["get_init_vals"],
-            "get_output": ["fit_graph"],
+            "get_output": ["get_init_vals"],
+            "compute_all": ["get_init_vals"],
+            "compare_graphs": ["get_init_vals"],
         }
 
         self.downstream = {
-            "select_data": {"plot_nyquist", "get_circuit", "get_init_vals", "fit_graph", "get_output"},
-            "get_circuit": {"get_init_vals", "fit_graph", "get_output"},
-            "get_init_vals": {"fit_graph", "get_output"},
-            "fit_graph": {"get_output"},
-            "plot_nyquist": set(),
+            "select_data": {
+                "plot_nyquist",
+                "get_circuit",
+                "get_init_vals",
+                "fit_graph",
+                "get_output",
+                "compute_all",
+                "compare_graphs",
+            },
+            "get_circuit": {"get_init_vals", "fit_graph", "get_output", "compute_all", "compare_graphs"},
+            "get_init_vals": {"fit_graph", "get_output", "compute_all", "compare_graphs"},
+            "fit_graph": set(),
             "get_output": set(),
+            "compute_all": set(),
+            "compare_graphs": set(),
+            "plot_nyquist": set(),
         }
 
     def can_run(self, step_name):
@@ -51,10 +69,7 @@ class StepFSM:
 
     def refresh_buttons(self):
         for step_name, button in self.buttons.items():
-            if self.can_run(step_name):
-                button.configure(state="normal")
-            else:
-                button.configure(state="disabled")
+            button.configure(state="normal" if self.can_run(step_name) else "disabled")
 
 
 class AppData:
@@ -73,7 +88,110 @@ class AppData:
         self.fit_parameters = None
         self.fit_prediction = None
         self.fit_circuit_string = None
+
         self.output_df = None
+        self.params_df = None
+        self.stats_df = None
+
+        self.batch_results = {}
+        self.available_plot_keys = []
+        self.selected_plot_key = None
+
+
+def compute_fit_statistics(z_data, z_fit, n_params, eps=1e-30):
+    z_data = np.asarray(z_data, dtype=complex)
+    z_fit = np.asarray(z_fit, dtype=complex)
+
+    if len(z_data) != len(z_fit):
+        raise ValueError("z_data and z_fit must have the same length.")
+
+    n_points = len(z_data)
+    dof = max(2 * n_points - n_params, 1)
+
+    residual = z_data - z_fit
+
+    chi_square = np.sum((residual.real ** 2) + (residual.imag ** 2))
+    reduced_chi_square = chi_square / dof
+
+    weights = np.abs(z_data) ** 2
+    weights = np.where(weights < eps, eps, weights)
+    chi_square_modulus = np.sum(
+        ((residual.real ** 2) + (residual.imag ** 2)) / weights
+    )
+    reduced_chi_square_modulus = chi_square_modulus / dof
+
+    rmse_real = np.sqrt(np.mean(residual.real ** 2))
+    rmse_imag = np.sqrt(np.mean(residual.imag ** 2))
+    rmse_modulus = np.sqrt(np.mean(np.abs(residual) ** 2))
+
+    mae_real = np.mean(np.abs(residual.real))
+    mae_imag = np.mean(np.abs(residual.imag))
+    mae_modulus = np.mean(np.abs(residual))
+
+    ss_res_real = np.sum((z_data.real - z_fit.real) ** 2)
+    ss_tot_real = np.sum((z_data.real - np.mean(z_data.real)) ** 2)
+    r2_real = np.nan if ss_tot_real < eps else 1 - ss_res_real / ss_tot_real
+
+    y_imag_data = -z_data.imag
+    y_imag_fit = -z_fit.imag
+    ss_res_imag = np.sum((y_imag_data - y_imag_fit) ** 2)
+    ss_tot_imag = np.sum((y_imag_data - np.mean(y_imag_data)) ** 2)
+    r2_imag = np.nan if ss_tot_imag < eps else 1 - ss_res_imag / ss_tot_imag
+
+    y_all = np.concatenate([z_data.real, -z_data.imag])
+    yhat_all = np.concatenate([z_fit.real, -z_fit.imag])
+    ss_res_all = np.sum((y_all - yhat_all) ** 2)
+    ss_tot_all = np.sum((y_all - np.mean(y_all)) ** 2)
+    r2_combined = np.nan if ss_tot_all < eps else 1 - ss_res_all / ss_tot_all
+
+    return {
+        "n_points": n_points,
+        "n_params": n_params,
+        "degrees_of_freedom": dof,
+        "chi_square": chi_square,
+        "reduced_chi_square": reduced_chi_square,
+        "chi_square_modulus": chi_square_modulus,
+        "reduced_chi_square_modulus": reduced_chi_square_modulus,
+        "RMSE_real": rmse_real,
+        "RMSE_imag": rmse_imag,
+        "RMSE_modulus": rmse_modulus,
+        "MAE_real": mae_real,
+        "MAE_imag": mae_imag,
+        "MAE_modulus": mae_modulus,
+        "R2_real": r2_real,
+        "R2_imag": r2_imag,
+        "R2_combined": r2_combined,
+    }
+
+
+def parse_parameter_names(circuit_formula):
+    element_tokens = re.findall(r"[A-Za-z]+\d+", circuit_formula)
+
+    param_map = {
+        "R": lambda tok: [tok],
+        "C": lambda tok: [tok],
+        "L": lambda tok: [tok],
+        "W": lambda tok: [tok],
+        "CPE": lambda tok: [f"{tok}_T", f"{tok}_P"],
+        "Wo": lambda tok: [f"{tok}_R", f"{tok}_T"],
+        "Ws": lambda tok: [f"{tok}_R", f"{tok}_T"],
+        "G": lambda tok: [f"{tok}_Y", f"{tok}_A"],
+    }
+
+    parameter_names = []
+
+    for token in element_tokens:
+        prefix_match = re.match(r"[A-Za-z]+", token)
+        if not prefix_match:
+            continue
+
+        prefix = prefix_match.group(0)
+        if prefix in param_map:
+            parameter_names.extend(param_map[prefix](token))
+        else:
+            parameter_names.append(token)
+
+    return parameter_names
 
 
 def file_read(filepath):
@@ -109,7 +227,6 @@ def file_read(filepath):
 
         while j < rows:
             freq_val = df.iloc[j, start]
-
             if pd.isna(freq_val):
                 break
 
@@ -121,16 +238,64 @@ def file_read(filepath):
             continue
 
         data = pd.DataFrame(data_rows, columns=col_names)
-        data = data.apply(pd.to_numeric, errors="coerce")
+
+        freq = pd.to_numeric(data["Frequency"], errors="coerce").to_numpy(dtype=float)
+        z_real = pd.to_numeric(data["Z'"], errors="coerce").to_numpy(dtype=float)
+        neg_z_imag = pd.to_numeric(data["-Z''"], errors="coerce").to_numpy(dtype=float)
+
+        if "Z" in data.columns:
+            z_mag = pd.to_numeric(data["Z"], errors="coerce").to_numpy(dtype=float)
+        else:
+            z_mag = np.full_like(freq, np.nan, dtype=float)
+
+        if "Phase" in data.columns:
+            phase = pd.to_numeric(data["Phase"], errors="coerce").to_numpy(dtype=float)
+        else:
+            phase = np.full_like(freq, np.nan, dtype=float)
+
+        if "Time" in data.columns:
+            time = pd.to_numeric(data["Time"], errors="coerce").to_numpy(dtype=float)
+        else:
+            time = np.full_like(freq, np.nan, dtype=float)
+
+        z_complex = z_real - 1j * neg_z_imag
+
+        mask = (
+            np.isfinite(freq)
+            & np.isfinite(z_real)
+            & np.isfinite(neg_z_imag)
+            & (freq > 0)
+        )
+
+        freq = freq[mask]
+        z_real = z_real[mask]
+        neg_z_imag = neg_z_imag[mask]
+        z_complex = z_complex[mask]
+        z_mag = z_mag[mask]
+        phase = phase[mask]
+        time = time[mask]
+
+        if len(freq) < 3:
+            continue
+
+        sort_idx = np.argsort(freq)[::-1]
+        freq = freq[sort_idx]
+        z_real = z_real[sort_idx]
+        neg_z_imag = neg_z_imag[sort_idx]
+        z_complex = z_complex[sort_idx]
+        z_mag = z_mag[sort_idx]
+        phase = phase[sort_idx]
+        time = time[sort_idx]
 
         block_dict = {
             "res": res,
-            "Frequency": data["Frequency"].dropna().tolist(),
-            "Z'": data["Z'"].dropna().tolist(),
-            "-Z''": data["-Z''"].dropna().tolist(),
-            "Z": data["Z"].dropna().tolist(),
-            "Phase": data["Phase"].dropna().tolist(),
-            "Time": data["Time"].dropna().tolist(),
+            "Frequency": freq,
+            "Z'": z_real,
+            "-Z''": neg_z_imag,
+            "Z_complex": z_complex,
+            "Z_mag": z_mag,
+            "Phase": phase,
+            "Time": time,
         }
 
         result.setdefault(section, []).append(block_dict)
@@ -146,47 +311,12 @@ def access_data(result, section_name, resistivity):
     return None
 
 
-def generate_nyquist_graph(ax, data):
-    ax.plot(data["Z'"], data["-Z''"])
+def generate_nyquist_graph(ax, z_complex, label=None, fmt="-"):
+    ax.plot(z_complex.real, -z_complex.imag, fmt, label=label)
     ax.set_title("Nyquist Plot")
-    ax.set_xlabel("Z'")
-    ax.set_ylabel("-Z''")
+    ax.set_xlabel("Z' (Ohms)")
+    ax.set_ylabel("-Z'' (Ohms)")
     ax.grid(True)
-
-
-def parse_parameter_names(circuit_formula):
-    """
-    Builds parameter names in left-to-right order matching the circuit text.
-    Extend param_map if you use more element types.
-    """
-    element_tokens = re.findall(r"[A-Za-z]+\d+", circuit_formula)
-
-    param_map = {
-        "R":  lambda tok: [tok],
-        "C":  lambda tok: [tok],
-        "L":  lambda tok: [tok],
-        "W":  lambda tok: [tok],
-        "CPE": lambda tok: [f"{tok}_T", f"{tok}_P"],
-        "Wo":  lambda tok: [f"{tok}_R", f"{tok}_T"],
-        "Ws":  lambda tok: [f"{tok}_R", f"{tok}_T"],
-        "G":   lambda tok: [f"{tok}_Y", f"{tok}_A"],
-    }
-
-    parameter_names = []
-
-    for token in element_tokens:
-        prefix_match = re.match(r"[A-Za-z]+", token)
-        if not prefix_match:
-            continue
-
-        prefix = prefix_match.group(0)
-
-        if prefix in param_map:
-            parameter_names.extend(param_map[prefix](token))
-        else:
-            parameter_names.append(token)
-
-    return parameter_names
 
 
 def create_ui():
@@ -195,7 +325,7 @@ def create_ui():
 
     app = ctk.CTk()
     app.title("EIS File Loader")
-    app.geometry("1200x800")
+    app.geometry("1350x900")
 
     fsm = StepFSM()
     app_data = AppData()
@@ -205,8 +335,8 @@ def create_ui():
     usable_width = 1 - (2 * margin)
     usable_height = 1 - (2 * margin) - gap
 
-    top_height = usable_height * (3 / 4)
-    bottom_height = usable_height * (1 / 4)
+    top_height = usable_height * 0.74
+    bottom_height = usable_height * 0.24
 
     app_frame = ctk.CTkFrame(master=app)
     app_frame.grid_rowconfigure(0, weight=1)
@@ -247,7 +377,7 @@ def create_ui():
         pady=10
     )
 
-    for row in range(2):
+    for row in range(3):
         control_frame.grid_rowconfigure(row, weight=1)
     for col in range(3):
         control_frame.grid_columnconfigure(col, weight=1)
@@ -257,6 +387,7 @@ def create_ui():
 
     material_var = ctk.StringVar(value="")
     resistivity_var = ctk.StringVar(value="")
+    plot_select_var = ctk.StringVar(value="")
 
     def clear_frame(frame):
         for widget in frame.winfo_children():
@@ -277,7 +408,7 @@ def create_ui():
         elif step_name == "get_init_vals":
             for name in ["Initial Values", "Fit", "Output"]:
                 clear_tab(name)
-        elif step_name == "fit_graph":
+        elif step_name in {"fit_graph", "get_output", "compute_all", "compare_graphs"}:
             for name in ["Fit", "Output"]:
                 clear_tab(name)
 
@@ -292,34 +423,69 @@ def create_ui():
 
         user_output_frame.set(tab_name)
 
+    def format_plot_key(material, resistivity):
+        return f"{material} | {resistivity}"
+
+    def parse_plot_key(key):
+        parts = key.split(" | ")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid plot key: {key}")
+        return parts[0], float(parts[1])
+
     def reset_selected_block():
         app_data.selected_material = None
         app_data.selected_resistivity = None
         app_data.selected_data = None
+
         app_data.circuit_formula = None
         app_data.parameter_names = []
         app_data.initial_guess = []
+
         app_data.fit_parameters = None
         app_data.fit_prediction = None
         app_data.fit_circuit_string = None
+
         app_data.output_df = None
+        app_data.params_df = None
+        app_data.stats_df = None
+
+        app_data.batch_results = {}
+        app_data.available_plot_keys = []
+        app_data.selected_plot_key = None
 
     def format_data_summary(extra_text=""):
-        if app_data.selected_data is None:
-            return "No selected data."
+        selected_blocks = get_selected_blocks()
 
-        data = app_data.selected_data
-        point_count = len(data["Frequency"])
-        first_freq = data["Frequency"][0] if data["Frequency"] else "N/A"
-        last_freq = data["Frequency"][-1] if data["Frequency"] else "N/A"
+        if not selected_blocks:
+            text = "No selected data."
+        elif len(selected_blocks) == 1:
+            data = selected_blocks[0][2]
+            point_count = len(data["Frequency"])
+            first_freq = data["Frequency"][0] if point_count > 0 else "N/A"
+            last_freq = data["Frequency"][-1] if point_count > 0 else "N/A"
 
-        text = (
-            f"File: {app_data.filepath}\n"
-            f"Material: {app_data.selected_material}\n"
-            f"Resistivity: {app_data.selected_resistivity}\n"
-            f"Points loaded: {point_count}\n"
-            f"Frequency range: {first_freq} -> {last_freq}"
-        )
+            material_label = (
+                "All Materials" if app_data.selected_material == ALL_MATERIALS else app_data.selected_material
+            )
+            resistivity_label = (
+                "All Resistivities" if app_data.selected_resistivity == ALL_RESISTIVITIES else app_data.selected_resistivity
+            )
+
+            text = (
+                f"File: {app_data.filepath}\n"
+                f"Material: {material_label}\n"
+                f"Resistivity: {resistivity_label}\n"
+                f"Points loaded: {point_count}\n"
+                f"Frequency range: {first_freq} -> {last_freq}\n"
+                f"Approx. high-frequency intercept Z': {data['Z_complex'].real[0]:.6g} Ohm"
+            )
+        else:
+            text = (
+                f"File: {app_data.filepath}\n"
+                f"Selected datasets: {len(selected_blocks)}\n"
+                f"Material selection: {'All Materials' if app_data.selected_material == ALL_MATERIALS else app_data.selected_material}\n"
+                f"Resistivity selection: {'All Resistivities' if app_data.selected_resistivity == ALL_RESISTIVITIES else app_data.selected_resistivity}"
+            )
 
         if extra_text:
             text += f"\n\n{extra_text}"
@@ -363,9 +529,31 @@ def create_ui():
                 f"{name} = {value}"
                 for name, value in zip(app_data.parameter_names, app_data.fit_parameters)
             )
+
+            stats_text = ""
+            if app_data.stats_df is not None and len(app_data.stats_df) == 1:
+                row = app_data.stats_df.iloc[0]
+                stats_text = (
+                    f"\n\nFit statistics:\n"
+                    f"n_points = {row['n_points']}\n"
+                    f"n_params = {row['n_params']}\n"
+                    f"dof = {row['degrees_of_freedom']}\n"
+                    f"chi_square = {row['chi_square']:.6g}\n"
+                    f"reduced_chi_square = {row['reduced_chi_square']:.6g}\n"
+                    f"chi_square_modulus = {row['chi_square_modulus']:.6g}\n"
+                    f"reduced_chi_square_modulus = {row['reduced_chi_square_modulus']:.6g}\n"
+                    f"RMSE_real = {row['RMSE_real']:.6g}\n"
+                    f"RMSE_imag = {row['RMSE_imag']:.6g}\n"
+                    f"RMSE_modulus = {row['RMSE_modulus']:.6g}\n"
+                    f"R2_real = {row['R2_real']:.6g}\n"
+                    f"R2_imag = {row['R2_imag']:.6g}\n"
+                    f"R2_combined = {row['R2_combined']:.6g}"
+                )
+
             text = (
                 f"Fitted circuit:\n{app_data.fit_circuit_string}\n\n"
                 f"Fitted parameters:\n{fit_vals}"
+                f"{stats_text}"
             )
 
         if extra_text:
@@ -379,14 +567,178 @@ def create_ui():
         else:
             text = (
                 f"Output ready.\n\n"
-                f"Rows: {len(app_data.output_df)}\n"
-                f"Columns: {list(app_data.output_df.columns)}"
+                f"Data rows: {len(app_data.output_df)}\n"
+                f"Data columns: {list(app_data.output_df.columns)}"
             )
 
         if extra_text:
             text += f"\n\n{extra_text}"
 
         return text
+
+    def get_selected_blocks():
+        selected = []
+
+        if not app_data.result:
+            return selected
+
+        if app_data.selected_material == ALL_MATERIALS:
+            for material, blocks in app_data.result.items():
+                for block in blocks:
+                    selected.append((material, block["res"], block))
+            return selected
+
+        if app_data.selected_material is None:
+            return selected
+
+        blocks = app_data.result.get(app_data.selected_material, [])
+
+        if app_data.selected_resistivity == ALL_RESISTIVITIES:
+            for block in blocks:
+                selected.append((app_data.selected_material, block["res"], block))
+            return selected
+
+        if app_data.selected_resistivity is not None:
+            block = access_data(
+                app_data.result,
+                app_data.selected_material,
+                app_data.selected_resistivity
+            )
+            if block is not None:
+                selected.append((app_data.selected_material, app_data.selected_resistivity, block))
+
+        return selected
+
+    def fit_single_dataset(material, resistivity, data):
+        freq = np.asarray(data["Frequency"], dtype=float)
+        z_complex = np.asarray(data["Z_complex"], dtype=complex)
+
+        circuit_obj = CustomCircuit(
+            app_data.circuit_formula,
+            initial_guess=app_data.initial_guess
+        )
+
+        try:
+            circuit_obj.fit(freq, z_complex, weight_by_modulus=True)
+        except TypeError:
+            circuit_obj.fit(freq, z_complex)
+
+        z_fit = np.asarray(circuit_obj.predict(freq), dtype=complex)
+
+        fit_parameters = list(circuit_obj.parameters_)
+        fit_circuit_string = str(circuit_obj)
+
+        stats_dict = compute_fit_statistics(
+            z_data=z_complex,
+            z_fit=z_fit,
+            n_params=len(fit_parameters)
+        )
+        stats_df = pd.DataFrame([stats_dict])
+
+        residual = z_complex - z_fit
+
+        output_df = pd.DataFrame({
+            "Frequency": freq,
+            "Zreal_data": z_complex.real,
+            "Neg_Zimag_data": -z_complex.imag,
+            "Zreal_fit": z_fit.real,
+            "Neg_Zimag_fit": -z_fit.imag,
+            "Residual_real": residual.real,
+            "Residual_imag": residual.imag,
+            "Residual_modulus": np.abs(residual),
+        })
+
+        params_df = pd.DataFrame({
+            "parameter": app_data.parameter_names,
+            "value": fit_parameters
+        })
+
+        return {
+            "material": material,
+            "resistivity": resistivity,
+            "data": data,
+            "fit_parameters": fit_parameters,
+            "fit_prediction": z_fit,
+            "fit_circuit_string": fit_circuit_string,
+            "output_df": output_df,
+            "params_df": params_df,
+            "stats_df": stats_df,
+        }
+
+    def load_result_into_active_fields(result_obj):
+        app_data.selected_material = result_obj["material"]
+        app_data.selected_resistivity = result_obj["resistivity"]
+        app_data.selected_data = result_obj["data"]
+        app_data.fit_parameters = result_obj["fit_parameters"]
+        app_data.fit_prediction = result_obj["fit_prediction"]
+        app_data.fit_circuit_string = result_obj["fit_circuit_string"]
+        app_data.output_df = result_obj["output_df"]
+        app_data.params_df = result_obj["params_df"]
+        app_data.stats_df = result_obj["stats_df"]
+
+    def ensure_current_single_result():
+        selected_blocks = get_selected_blocks()
+
+        if len(selected_blocks) != 1:
+            raise ValueError("This action requires exactly one selected dataset, or use Compute All first.")
+
+        material, resistivity, data = selected_blocks[0]
+        key = (material, resistivity)
+
+        if key not in app_data.batch_results:
+            app_data.batch_results[key] = fit_single_dataset(material, resistivity, data)
+
+        load_result_into_active_fields(app_data.batch_results[key])
+
+    def build_batch_summary():
+        if not app_data.batch_results:
+            return "No computed results available."
+
+        lines = [f"Computed datasets: {len(app_data.batch_results)}", ""]
+        for (material, resistivity), result_obj in sorted(app_data.batch_results.items()):
+            row = result_obj["stats_df"].iloc[0]
+            lines.append(
+                f"{material} | {resistivity} -> "
+                f"R2_combined={row['R2_combined']:.6g}, "
+                f"chi_square={row['chi_square']:.6g}"
+            )
+        return "\n".join(lines)
+
+    def show_graph_selector():
+        if not app_data.batch_results:
+            return
+
+        ctk.CTkLabel(
+            user_input_frame,
+            text="Select computed graph",
+            anchor="w"
+        ).pack(fill="x", padx=10, pady=(10, 5))
+
+        plot_keys = [
+            format_plot_key(material, resistivity)
+            for material, resistivity in sorted(app_data.batch_results.keys())
+        ]
+        app_data.available_plot_keys = plot_keys
+
+        if not plot_keys:
+            return
+
+        if app_data.selected_plot_key in plot_keys:
+            plot_select_var.set(app_data.selected_plot_key)
+        else:
+            app_data.selected_plot_key = plot_keys[0]
+            plot_select_var.set(plot_keys[0])
+
+        def on_plot_key_change(choice):
+            app_data.selected_plot_key = choice
+
+        selector = ctk.CTkOptionMenu(
+            master=user_input_frame,
+            variable=plot_select_var,
+            values=plot_keys,
+            command=on_plot_key_change
+        )
+        selector.pack(fill="x", padx=10, pady=(0, 10))
 
     def invalidate_after_data_change():
         fsm.invalidate_downstream("select_data")
@@ -406,7 +758,8 @@ def create_ui():
             ).pack(fill="x", padx=10, pady=10)
             return
 
-        materials = sorted(app_data.result.keys())
+        materials = [ALL_MATERIALS] + sorted(app_data.result.keys())
+        material_labels = ["All Materials"] + sorted(app_data.result.keys())
 
         ctk.CTkLabel(
             user_input_frame,
@@ -421,48 +774,76 @@ def create_ui():
             anchor="w"
         ).pack(fill="x", padx=10, pady=(0, 5))
 
+        material_display_to_value = dict(zip(material_labels, materials))
+        material_value_to_display = {v: k for k, v in material_display_to_value.items()}
+
+        current_material_display = material_value_to_display.get(app_data.selected_material, material_labels[0])
+        material_var.set(current_material_display)
+
+        def material_changed(display_choice):
+            on_material_change(material_display_to_value[display_choice])
+
         material_menu = ctk.CTkOptionMenu(
             master=user_input_frame,
             variable=material_var,
-            values=materials,
-            command=on_material_change
+            values=material_labels,
+            command=material_changed
         )
         material_menu.pack(fill="x", padx=10, pady=(0, 10))
 
-        if materials:
-            if app_data.selected_material in materials:
-                material_var.set(app_data.selected_material)
-            else:
-                material_var.set(materials[0])
-                on_material_change(materials[0])
-                return
+        if app_data.selected_material is None:
+            on_material_change(ALL_MATERIALS)
+            return
 
-        if app_data.selected_material:
-            ctk.CTkLabel(
-                user_input_frame,
-                text="Resistivity",
-                anchor="w"
-            ).pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(
+            user_input_frame,
+            text="Resistivity",
+            anchor="w"
+        ).pack(fill="x", padx=10, pady=(10, 5))
 
-            resistivity_values = sorted(
+        if app_data.selected_material == ALL_MATERIALS:
+            resistivity_values = [ALL_RESISTIVITIES]
+            resistivity_labels = ["All Resistivities"]
+        else:
+            resistivity_values = [ALL_RESISTIVITIES] + sorted(
                 [str(block["res"]) for block in app_data.result.get(app_data.selected_material, [])],
                 key=lambda x: float(x)
             )
+            resistivity_labels = ["All Resistivities"] + [
+                val for val in resistivity_values if val != ALL_RESISTIVITIES
+            ]
 
-            if resistivity_values:
-                resistivity_menu = ctk.CTkOptionMenu(
-                    master=user_input_frame,
-                    variable=resistivity_var,
-                    values=resistivity_values,
-                    command=on_resistivity_change
-                )
-                resistivity_menu.pack(fill="x", padx=10, pady=(0, 10))
+        resistivity_display_to_value = {}
+        for label in resistivity_labels:
+            if label == "All Resistivities":
+                resistivity_display_to_value[label] = ALL_RESISTIVITIES
+            else:
+                resistivity_display_to_value[label] = label
 
-                if app_data.selected_resistivity is not None:
-                    resistivity_var.set(str(app_data.selected_resistivity))
-                else:
-                    resistivity_var.set(resistivity_values[0])
-                    on_resistivity_change(resistivity_values[0])
+        resistivity_value_to_display = {v: k for k, v in resistivity_display_to_value.items()}
+
+        current_res_value = (
+            ALL_RESISTIVITIES if app_data.selected_resistivity == ALL_RESISTIVITIES else
+            str(app_data.selected_resistivity) if app_data.selected_resistivity is not None else
+            "All Resistivities"
+        )
+        current_res_display = resistivity_value_to_display.get(current_res_value, "All Resistivities")
+        resistivity_var.set(current_res_display)
+
+        def resistivity_changed(display_choice):
+            raw_value = resistivity_display_to_value[display_choice]
+            on_resistivity_change(raw_value)
+
+        resistivity_menu = ctk.CTkOptionMenu(
+            master=user_input_frame,
+            variable=resistivity_var,
+            values=resistivity_labels,
+            command=resistivity_changed
+        )
+        resistivity_menu.pack(fill="x", padx=10, pady=(0, 10))
+
+        if app_data.batch_results:
+            show_graph_selector()
 
     def show_circuit_prompt():
         clear_frame(user_input_frame)
@@ -475,14 +856,19 @@ def create_ui():
 
         ctk.CTkLabel(
             user_input_frame,
-            text="Example: L0-R0-p(R1,CPE1)-p(R2,CPE2)",
-            anchor="w",
-            justify="left"
+            text=(
+                "Examples:\n"
+                "L0-R0-p(R1,CPE1)\n"
+                "L0-R0-p(R1,CPE1)-p(R2,CPE2)\n\n"
+                "Tip: for depressed arcs, CPE usually fits better than C."
+            ),
+            justify="left",
+            anchor="w"
         ).pack(fill="x", padx=10, pady=(0, 10))
 
         circuit_entry = ctk.CTkEntry(
             master=user_input_frame,
-            placeholder_text="L0-R0-p(R1,CPE1)-p(R2,CPE2)"
+            placeholder_text="L0-R0-p(R1,CPE1)"
         )
         circuit_entry.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -505,10 +891,16 @@ def create_ui():
             app_data.circuit_formula = circuit_formula
             app_data.parameter_names = parameter_names
             app_data.initial_guess = []
+
             app_data.fit_parameters = None
             app_data.fit_prediction = None
             app_data.fit_circuit_string = None
             app_data.output_df = None
+            app_data.params_df = None
+            app_data.stats_df = None
+            app_data.batch_results = {}
+            app_data.available_plot_keys = []
+            app_data.selected_plot_key = None
 
             fsm.invalidate_downstream("get_circuit")
             fsm.completed.discard("get_circuit")
@@ -548,6 +940,18 @@ def create_ui():
             ).pack(fill="x", padx=10, pady=10)
             return
 
+        ctk.CTkLabel(
+            user_input_frame,
+            text=(
+                "Tip:\n"
+                "- Set R0 near the left intercept of the Nyquist plot\n"
+                "- Start with a simpler circuit first\n"
+                "- For depressed arcs, prefer CPE over C"
+            ),
+            justify="left",
+            anchor="w"
+        ).pack(fill="x", padx=10, pady=(0, 10))
+
         entries = {}
 
         for i, param_name in enumerate(app_data.parameter_names):
@@ -586,6 +990,11 @@ def create_ui():
             app_data.fit_prediction = None
             app_data.fit_circuit_string = None
             app_data.output_df = None
+            app_data.params_df = None
+            app_data.stats_df = None
+            app_data.batch_results = {}
+            app_data.available_plot_keys = []
+            app_data.selected_plot_key = None
 
             fsm.invalidate_downstream("get_init_vals")
             fsm.completed.discard("get_init_vals")
@@ -607,6 +1016,9 @@ def create_ui():
             command=show_circuit_prompt
         ).pack(fill="x", padx=10, pady=(0, 10))
 
+        if app_data.batch_results:
+            show_graph_selector()
+
     def show_export_output_prompt():
         clear_frame(user_input_frame)
 
@@ -616,8 +1028,11 @@ def create_ui():
             anchor="w"
         ).pack(fill="x", padx=10, pady=(10, 10))
 
+        if app_data.batch_results:
+            show_graph_selector()
+
         def export_excel():
-            if app_data.output_df is None:
+            if app_data.output_df is None and not app_data.batch_results:
                 show_tab_text("Output", "No output available to export.")
                 return
 
@@ -630,7 +1045,29 @@ def create_ui():
             if not filepath:
                 return
 
-            app_data.output_df.to_excel(filepath, index=False)
+            with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+                if app_data.batch_results:
+                    summary_rows = []
+                    for (material, resistivity), result_obj in sorted(app_data.batch_results.items()):
+                        row = result_obj["stats_df"].iloc[0].to_dict()
+                        row["material"] = material
+                        row["resistivity"] = resistivity
+                        summary_rows.append(row)
+
+                        safe_sheet = f"{material}_{resistivity}".replace("/", "_")[:25]
+                        result_obj["output_df"].to_excel(writer, sheet_name=f"fit_{safe_sheet}"[:31], index=False)
+                        result_obj["params_df"].to_excel(writer, sheet_name=f"params_{safe_sheet}"[:31], index=False)
+
+                    pd.DataFrame(summary_rows).to_excel(writer, sheet_name="fit_stats_summary", index=False)
+                else:
+                    app_data.output_df.to_excel(writer, sheet_name="fit_data", index=False)
+
+                    if app_data.params_df is not None:
+                        app_data.params_df.to_excel(writer, sheet_name="fit_parameters", index=False)
+
+                    if app_data.stats_df is not None:
+                        app_data.stats_df.to_excel(writer, sheet_name="fit_stats", index=False)
+
             show_tab_text("Output", format_output_summary(f"Saved to:\n{filepath}"))
 
         ctk.CTkButton(
@@ -646,7 +1083,32 @@ def create_ui():
         ).pack(fill="x", padx=10, pady=(0, 10))
 
     def on_resistivity_change(choice):
-        if not app_data.result or not app_data.selected_material:
+        if not app_data.result:
+            return
+
+        if choice == ALL_RESISTIVITIES:
+            app_data.selected_resistivity = ALL_RESISTIVITIES
+            app_data.selected_data = None
+            app_data.fit_parameters = None
+            app_data.fit_prediction = None
+            app_data.fit_circuit_string = None
+            app_data.output_df = None
+            app_data.params_df = None
+            app_data.stats_df = None
+            app_data.batch_results = {}
+            app_data.available_plot_keys = []
+            app_data.selected_plot_key = None
+
+            invalidate_after_data_change()
+            show_tab_text("Data", format_data_summary("All resistivities selected."))
+            return
+
+        if app_data.selected_material == ALL_MATERIALS:
+            app_data.selected_resistivity = ALL_RESISTIVITIES
+            app_data.selected_data = None
+
+            invalidate_after_data_change()
+            show_tab_text("Data", format_data_summary("All materials selected."))
             return
 
         try:
@@ -660,18 +1122,30 @@ def create_ui():
         if data is None:
             app_data.selected_resistivity = None
             app_data.selected_data = None
-            show_tab_text("Data", f"No data found for material='{app_data.selected_material}' and resistivity={resistivity}.")
+            show_tab_text(
+                "Data",
+                f"No data found for material='{app_data.selected_material}' and resistivity={resistivity}."
+            )
             return
 
         app_data.selected_resistivity = resistivity
         app_data.selected_data = data
+
         app_data.circuit_formula = None
         app_data.parameter_names = []
         app_data.initial_guess = []
+
         app_data.fit_parameters = None
         app_data.fit_prediction = None
         app_data.fit_circuit_string = None
+
         app_data.output_df = None
+        app_data.params_df = None
+        app_data.stats_df = None
+
+        app_data.batch_results = {}
+        app_data.available_plot_keys = []
+        app_data.selected_plot_key = None
 
         invalidate_after_data_change()
         show_tab_text("Data", format_data_summary())
@@ -681,17 +1155,33 @@ def create_ui():
             return
 
         app_data.selected_material = choice
-        app_data.selected_resistivity = None
-        app_data.selected_data = None
+
+        if choice == ALL_MATERIALS:
+            app_data.selected_resistivity = ALL_RESISTIVITIES
+            app_data.selected_data = None
+        else:
+            app_data.selected_resistivity = ALL_RESISTIVITIES
+            app_data.selected_data = None
+
         app_data.circuit_formula = None
         app_data.parameter_names = []
         app_data.initial_guess = []
+
         app_data.fit_parameters = None
         app_data.fit_prediction = None
         app_data.fit_circuit_string = None
+
         app_data.output_df = None
+        app_data.params_df = None
+        app_data.stats_df = None
+
+        app_data.batch_results = {}
+        app_data.available_plot_keys = []
+        app_data.selected_plot_key = None
 
         show_file_and_selectors()
+        invalidate_after_data_change()
+        show_tab_text("Data", format_data_summary())
 
     def run_step(step_name, action):
         if not fsm.can_run(step_name):
@@ -715,6 +1205,8 @@ def create_ui():
                 "get_init_vals": "Initial Values",
                 "fit_graph": "Fit",
                 "get_output": "Output",
+                "compute_all": "Fit",
+                "compare_graphs": "Fit",
             }.get(step_name, "Output")
 
             show_tab_text(error_tab, f"{step_name} failed:\n{e}")
@@ -741,12 +1233,21 @@ def create_ui():
         show_tab_text("Data", "File loaded. Select material and resistivity.")
 
     def plot_nyquist_step():
-        if app_data.selected_data is None:
+        selected_blocks = get_selected_blocks()
+
+        if not selected_blocks:
             raise ValueError("No selected material/resistivity data.")
 
         fig, ax = plt.subplots()
-        generate_nyquist_graph(ax, app_data.selected_data)
-        plt.legend(["Data"])
+
+        if len(selected_blocks) == 1:
+            material, resistivity, data = selected_blocks[0]
+            generate_nyquist_graph(ax, data["Z_complex"], label=f"{material} | {resistivity}", fmt="-")
+        else:
+            for material, resistivity, data in selected_blocks:
+                generate_nyquist_graph(ax, data["Z_complex"], label=f"{material} | {resistivity}", fmt="-")
+
+        ax.legend()
         plt.tight_layout()
         plt.show()
         plt.close(fig)
@@ -754,7 +1255,7 @@ def create_ui():
         show_tab_text("Data", format_data_summary("Nyquist plot generated."))
 
     def get_circuit_step():
-        if app_data.selected_data is None:
+        if not get_selected_blocks():
             raise ValueError("No selected material/resistivity data.")
 
         show_circuit_prompt()
@@ -764,7 +1265,7 @@ def create_ui():
         else:
             show_tab_text(
                 "Circuit",
-                "Enter a circuit formula in the input panel.\n\nExample:\nL0-R0-p(R1,CPE1)-p(R2,CPE2)"
+                "Enter a circuit formula in the input panel.\n\nSuggested start:\nL0-R0-p(R1,CPE1)"
             )
 
     def get_init_vals_step():
@@ -782,26 +1283,81 @@ def create_ui():
                 "These values must match the fit-parameter order shown in the Circuit tab."
             )
 
-    def fit_graph_step():
-        if app_data.selected_data is None:
-            raise ValueError("No selected data available.")
+    def compute_all_step():
         if app_data.circuit_formula is None:
             raise ValueError("No circuit formula available.")
         if not app_data.initial_guess:
             raise ValueError("No initial guess available.")
 
-        data = app_data.selected_data
-        circuit_obj = CustomCircuit(app_data.circuit_formula, initial_guess=app_data.initial_guess)
-        circuit_obj.fit(data["Frequency"], data["Z"])
+        selected_blocks = get_selected_blocks()
+        if not selected_blocks:
+            raise ValueError("No selected data available.")
 
-        app_data.fit_parameters = list(circuit_obj.parameters_)
-        app_data.fit_circuit_string = str(circuit_obj)
-        app_data.fit_prediction = circuit_obj.predict(data["Frequency"])
+        app_data.batch_results = {}
+
+        failures = []
+        for material, resistivity, data in selected_blocks:
+            try:
+                app_data.batch_results[(material, resistivity)] = fit_single_dataset(material, resistivity, data)
+            except Exception as exc:
+                failures.append(f"{material} | {resistivity}: {exc}")
+
+        if not app_data.batch_results:
+            raise ValueError("All fits failed.\n" + "\n".join(failures))
+
+        first_key = sorted(app_data.batch_results.keys())[0]
+        first_result = app_data.batch_results[first_key]
+        load_result_into_active_fields(first_result)
+
+        app_data.available_plot_keys = [
+            format_plot_key(material, resistivity)
+            for material, resistivity in sorted(app_data.batch_results.keys())
+        ]
+        app_data.selected_plot_key = app_data.available_plot_keys[0] if app_data.available_plot_keys else None
+
+        show_file_and_selectors()
+
+        msg = build_batch_summary()
+        if failures:
+            msg += "\n\nFailures:\n" + "\n".join(failures)
+
+        show_tab_text("Fit", msg)
+
+    def fit_graph_step():
+        if app_data.batch_results:
+            if not app_data.selected_plot_key:
+                raise ValueError("No computed graph selected.")
+
+            material, resistivity = parse_plot_key(app_data.selected_plot_key)
+            key = (material, resistivity)
+
+            if key not in app_data.batch_results:
+                raise ValueError("Selected graph result not found.")
+
+            result_obj = app_data.batch_results[key]
+            load_result_into_active_fields(result_obj)
+
+            z_data = np.asarray(result_obj["data"]["Z_complex"], dtype=complex)
+            z_fit = np.asarray(result_obj["fit_prediction"], dtype=complex)
+
+            fig, ax = plt.subplots()
+            generate_nyquist_graph(ax, z_data, label="Data", fmt="-")
+            generate_nyquist_graph(ax, z_fit, label="Fit", fmt="-")
+            ax.set_title(f"Nyquist Fit: {material} | {resistivity}")
+            ax.legend()
+            plt.tight_layout()
+            plt.show()
+            plt.close(fig)
+
+            show_tab_text("Fit", format_fit_summary(f"Fit graph generated for {material} | {resistivity}."))
+            return
+
+        ensure_current_single_result()
 
         fig, ax = plt.subplots()
-        generate_nyquist_graph(ax, data)
-        plot_nyquist(app_data.fit_prediction, fmt="-", scale=10, ax=ax)
-        plt.legend(["Data", "Fit"])
+        generate_nyquist_graph(ax, app_data.selected_data["Z_complex"], label="Data", fmt="-")
+        generate_nyquist_graph(ax, app_data.fit_prediction, label="Fit", fmt="-")
+        ax.legend()
         plt.tight_layout()
         plt.show()
         plt.close(fig)
@@ -809,31 +1365,79 @@ def create_ui():
         show_tab_text("Fit", format_fit_summary("Fit graph generated and displayed."))
 
     def get_output_step():
-        if app_data.fit_parameters is None:
-            raise ValueError("Fit results are not available.")
+        if app_data.batch_results:
+            if not app_data.selected_plot_key:
+                raise ValueError("No computed result selected.")
 
-        data = app_data.selected_data
-        z_fit = app_data.fit_prediction
+            material, resistivity = parse_plot_key(app_data.selected_plot_key)
+            key = (material, resistivity)
 
-        app_data.output_df = pd.DataFrame({
-            "Frequency": data["Frequency"],
-            "Z_data": data["Z"],
-            "Z_fit": z_fit,
-            "Z_prime": data["Z'"],
-            "minus_Z_double_prime": data["-Z''"],
-        })
+            if key not in app_data.batch_results:
+                raise ValueError("Selected output result not found.")
 
-        params_df = pd.DataFrame({
-            "parameter": app_data.parameter_names,
-            "value": app_data.fit_parameters
-        })
+            result_obj = app_data.batch_results[key]
+            load_result_into_active_fields(result_obj)
+
+            row = app_data.stats_df.iloc[0]
+
+            output_text = format_output_summary(
+                f"Selected result: {material} | {resistivity}\n\n"
+                "Fitted parameters:\n" +
+                "\n".join(f"{r['parameter']} = {r['value']}" for _, r in app_data.params_df.iterrows()) +
+                "\n\nFit quality:\n"
+                f"chi_square = {row['chi_square']:.6g}\n"
+                f"reduced_chi_square = {row['reduced_chi_square']:.6g}\n"
+                f"chi_square_modulus = {row['chi_square_modulus']:.6g}\n"
+                f"reduced_chi_square_modulus = {row['reduced_chi_square_modulus']:.6g}\n"
+                f"R2_real = {row['R2_real']:.6g}\n"
+                f"R2_imag = {row['R2_imag']:.6g}\n"
+                f"R2_combined = {row['R2_combined']:.6g}"
+            )
+
+            show_tab_text("Output", output_text)
+            show_export_output_prompt()
+            return
+
+        ensure_current_single_result()
+
+        row = app_data.stats_df.iloc[0]
 
         output_text = format_output_summary(
             "Fitted parameters:\n" +
-            "\n".join(f"{row['parameter']} = {row['value']}" for _, row in params_df.iterrows())
+            "\n".join(f"{r['parameter']} = {r['value']}" for _, r in app_data.params_df.iterrows()) +
+            "\n\nFit quality:\n"
+            f"chi_square = {row['chi_square']:.6g}\n"
+            f"reduced_chi_square = {row['reduced_chi_square']:.6g}\n"
+            f"chi_square_modulus = {row['chi_square_modulus']:.6g}\n"
+            f"reduced_chi_square_modulus = {row['reduced_chi_square_modulus']:.6g}\n"
+            f"R2_real = {row['R2_real']:.6g}\n"
+            f"R2_imag = {row['R2_imag']:.6g}\n"
+            f"R2_combined = {row['R2_combined']:.6g}"
         )
+
         show_tab_text("Output", output_text)
         show_export_output_prompt()
+
+    def compare_graphs_step():
+        if not app_data.batch_results:
+            raise ValueError("Run Compute All first to compare graphs.")
+
+        fig, ax = plt.subplots()
+
+        for (material, resistivity), result_obj in sorted(app_data.batch_results.items()):
+            z_data = np.asarray(result_obj["data"]["Z_complex"], dtype=complex)
+            z_fit = np.asarray(result_obj["fit_prediction"], dtype=complex)
+
+            generate_nyquist_graph(ax, z_data, label=f"Data {material} | {resistivity}", fmt="-")
+            generate_nyquist_graph(ax, z_fit, label=f"Fit {material} | {resistivity}", fmt="--")
+
+        ax.set_title("Compare Graphs")
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+
+        show_tab_text("Fit", build_batch_summary() + "\n\nComparison graph displayed.")
 
     button_defs = [
         ("Select Data", "select_data", select_data),
@@ -842,6 +1446,8 @@ def create_ui():
         ("Get Init. Vals.", "get_init_vals", get_init_vals_step),
         ("Fit Graph", "fit_graph", fit_graph_step),
         ("Get Output", "get_output", get_output_step),
+        ("Compute All", "compute_all", compute_all_step),
+        ("Compare Graphs", "compare_graphs", compare_graphs_step),
     ]
 
     for i, (label, step_name, action) in enumerate(button_defs):
@@ -869,4 +1475,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

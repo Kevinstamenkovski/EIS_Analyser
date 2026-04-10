@@ -6,7 +6,6 @@ import matplotlib
 
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-
 from tkinter import filedialog
 from impedance.models.circuits import CustomCircuit
 
@@ -29,6 +28,8 @@ class StepFSM:
             "get_output": ["get_init_vals"],
             "compute_all": ["get_init_vals"],
             "compare_graphs": ["get_init_vals"],
+            "batch_fit_report": ["get_init_vals"],
+            "export_batch_report": ["batch_fit_report"],
         }
 
         self.downstream = {
@@ -40,14 +41,33 @@ class StepFSM:
                 "get_output",
                 "compute_all",
                 "compare_graphs",
+                "batch_fit_report",
+                "export_batch_report",
             },
-            "get_circuit": {"get_init_vals", "fit_graph", "get_output", "compute_all", "compare_graphs"},
-            "get_init_vals": {"fit_graph", "get_output", "compute_all", "compare_graphs"},
+            "get_circuit": {
+                "get_init_vals",
+                "fit_graph",
+                "get_output",
+                "compute_all",
+                "compare_graphs",
+                "batch_fit_report",
+                "export_batch_report",
+            },
+            "get_init_vals": {
+                "fit_graph",
+                "get_output",
+                "compute_all",
+                "compare_graphs",
+                "batch_fit_report",
+                "export_batch_report",
+            },
             "fit_graph": set(),
             "get_output": set(),
             "compute_all": set(),
             "compare_graphs": set(),
             "plot_nyquist": set(),
+            "batch_fit_report": {"export_batch_report"},
+            "export_batch_report": set(),
         }
 
     def can_run(self, step_name):
@@ -96,6 +116,98 @@ class AppData:
         self.batch_results = {}
         self.available_plot_keys = []
         self.selected_plot_key = None
+
+        self.batch_fit_rows = []
+        self.batch_report_df = None
+
+
+def natural_sort_key(text):
+    text = str(text)
+    return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", text)]
+
+
+def prettify_report_columns(df):
+    rename_map = {}
+    for col in df.columns:
+        if isinstance(col, str):
+            if col.startswith("CPE") and col.endswith("_T"):
+                rename_map[col] = col.replace("_T", "_Y0")
+            elif col.startswith("CPE") and col.endswith("_P"):
+                rename_map[col] = col.replace("_P", "_n")
+    return df.rename(columns=rename_map)
+
+
+def build_batch_report_df(batch_fit_rows):
+    if not batch_fit_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(batch_fit_rows)
+
+    fixed_cols = [
+        "EIS_ID",
+        "Material",
+        "Resistivity",
+        "Circuit",
+        "n_points",
+        "n_params",
+        "degrees_of_freedom",
+    ]
+
+    metric_cols = [
+        "chi_square",
+        "reduced_chi_square",
+        "chi_square_modulus",
+        "reduced_chi_square_modulus",
+        "RMSE_real",
+        "RMSE_imag",
+        "RMSE_modulus",
+        "MAE_real",
+        "MAE_imag",
+        "MAE_modulus",
+        "R2_real",
+        "R2_imag",
+        "R2_combined",
+    ]
+
+    special_cols = set(fixed_cols + metric_cols)
+    param_cols = [c for c in df.columns if c not in special_cols]
+    param_cols = sorted(param_cols, key=natural_sort_key)
+
+    ordered_cols = (
+        [c for c in fixed_cols if c in df.columns]
+        + param_cols
+        + [c for c in metric_cols if c in df.columns]
+    )
+
+    df = df[ordered_cols]
+    df = prettify_report_columns(df)
+    return df
+
+
+def append_batch_fit_result(
+    batch_rows,
+    material,
+    resistivity,
+    circuit_formula,
+    parameter_names,
+    fit_parameters,
+    stats_dict
+):
+    row = {
+        "EIS_ID": f"{material} | {resistivity}",
+        "Material": material,
+        "Resistivity": resistivity,
+        "Circuit": circuit_formula,
+    }
+
+    for name, value in zip(parameter_names, fit_parameters):
+        row[name] = float(value)
+
+    if stats_dict is not None:
+        for key, value in stats_dict.items():
+            row[key] = value
+
+    batch_rows.append(row)
 
 
 def compute_fit_statistics(z_data, z_fit, n_params, eps=1e-30):
@@ -347,13 +459,7 @@ def create_ui():
     user_output_frame = ctk.CTkTabview(master=app_frame)
     control_frame = ctk.CTkFrame(master=app)
 
-    app_frame.place(
-        relx=margin,
-        rely=margin,
-        relwidth=usable_width,
-        relheight=top_height
-    )
-
+    app_frame.place(relx=margin, rely=margin, relwidth=usable_width, relheight=top_height)
     control_frame.place(
         relx=margin,
         rely=margin + top_height + gap,
@@ -361,23 +467,10 @@ def create_ui():
         relheight=bottom_height
     )
 
-    user_input_frame.grid(
-        row=0,
-        column=0,
-        sticky="nsew",
-        padx=(10, 5),
-        pady=10
-    )
+    user_input_frame.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+    user_output_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
 
-    user_output_frame.grid(
-        row=0,
-        column=1,
-        sticky="nsew",
-        padx=(5, 10),
-        pady=10
-    )
-
-    for row in range(3):
+    for row in range(4):
         control_frame.grid_rowconfigure(row, weight=1)
     for col in range(3):
         control_frame.grid_columnconfigure(col, weight=1)
@@ -408,7 +501,14 @@ def create_ui():
         elif step_name == "get_init_vals":
             for name in ["Initial Values", "Fit", "Output"]:
                 clear_tab(name)
-        elif step_name in {"fit_graph", "get_output", "compute_all", "compare_graphs"}:
+        elif step_name in {
+            "fit_graph",
+            "get_output",
+            "compute_all",
+            "compare_graphs",
+            "batch_fit_report",
+            "export_batch_report",
+        }:
             for name in ["Fit", "Output"]:
                 clear_tab(name)
 
@@ -452,6 +552,9 @@ def create_ui():
         app_data.batch_results = {}
         app_data.available_plot_keys = []
         app_data.selected_plot_key = None
+
+        app_data.batch_fit_rows = []
+        app_data.batch_report_df = None
 
     def format_data_summary(extra_text=""):
         selected_blocks = get_selected_blocks()
@@ -708,11 +811,9 @@ def create_ui():
         if not app_data.batch_results:
             return
 
-        ctk.CTkLabel(
-            user_input_frame,
-            text="Select computed graph",
-            anchor="w"
-        ).pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(user_input_frame, text="Select computed graph", anchor="w").pack(
+            fill="x", padx=10, pady=(10, 5)
+        )
 
         plot_keys = [
             format_plot_key(material, resistivity)
@@ -751,11 +852,7 @@ def create_ui():
         clear_frame(user_input_frame)
 
         if not app_data.result:
-            ctk.CTkLabel(
-                user_input_frame,
-                text="No file loaded.",
-                anchor="w"
-            ).pack(fill="x", padx=10, pady=10)
+            ctk.CTkLabel(user_input_frame, text="No file loaded.", anchor="w").pack(fill="x", padx=10, pady=10)
             return
 
         materials = [ALL_MATERIALS] + sorted(app_data.result.keys())
@@ -768,11 +865,7 @@ def create_ui():
             anchor="w"
         ).pack(fill="x", padx=10, pady=(10, 15))
 
-        ctk.CTkLabel(
-            user_input_frame,
-            text="Material",
-            anchor="w"
-        ).pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(user_input_frame, text="Material", anchor="w").pack(fill="x", padx=10, pady=(0, 5))
 
         material_display_to_value = dict(zip(material_labels, materials))
         material_value_to_display = {v: k for k, v in material_display_to_value.items()}
@@ -795,11 +888,7 @@ def create_ui():
             on_material_change(ALL_MATERIALS)
             return
 
-        ctk.CTkLabel(
-            user_input_frame,
-            text="Resistivity",
-            anchor="w"
-        ).pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(user_input_frame, text="Resistivity", anchor="w").pack(fill="x", padx=10, pady=(10, 5))
 
         if app_data.selected_material == ALL_MATERIALS:
             resistivity_values = [ALL_RESISTIVITIES]
@@ -848,11 +937,7 @@ def create_ui():
     def show_circuit_prompt():
         clear_frame(user_input_frame)
 
-        ctk.CTkLabel(
-            user_input_frame,
-            text="Enter circuit formula",
-            anchor="w"
-        ).pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(user_input_frame, text="Enter circuit formula", anchor="w").pack(fill="x", padx=10, pady=(10, 5))
 
         ctk.CTkLabel(
             user_input_frame,
@@ -866,10 +951,7 @@ def create_ui():
             anchor="w"
         ).pack(fill="x", padx=10, pady=(0, 10))
 
-        circuit_entry = ctk.CTkEntry(
-            master=user_input_frame,
-            placeholder_text="L0-R0-p(R1,CPE1)"
-        )
+        circuit_entry = ctk.CTkEntry(master=user_input_frame, placeholder_text="L0-R0-p(R1,CPE1)")
         circuit_entry.pack(fill="x", padx=10, pady=(0, 10))
 
         if app_data.circuit_formula:
@@ -901,6 +983,8 @@ def create_ui():
             app_data.batch_results = {}
             app_data.available_plot_keys = []
             app_data.selected_plot_key = None
+            app_data.batch_fit_rows = []
+            app_data.batch_report_df = None
 
             fsm.invalidate_downstream("get_circuit")
             fsm.completed.discard("get_circuit")
@@ -911,26 +995,18 @@ def create_ui():
             show_tab_text("Circuit", format_circuit_summary())
             show_init_vals_prompt()
 
-        ctk.CTkButton(
-            master=user_input_frame,
-            text="Confirm Circuit",
-            command=confirm_circuit
-        ).pack(fill="x", padx=10, pady=(5, 10))
+        ctk.CTkButton(master=user_input_frame, text="Confirm Circuit", command=confirm_circuit).pack(
+            fill="x", padx=10, pady=(5, 10)
+        )
 
-        ctk.CTkButton(
-            master=user_input_frame,
-            text="Back to Data Selectors",
-            command=show_file_and_selectors
-        ).pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(master=user_input_frame, text="Back to Data Selectors", command=show_file_and_selectors).pack(
+            fill="x", padx=10, pady=(0, 10)
+        )
 
     def show_init_vals_prompt():
         clear_frame(user_input_frame)
 
-        ctk.CTkLabel(
-            user_input_frame,
-            text="Enter initial values",
-            anchor="w"
-        ).pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkLabel(user_input_frame, text="Enter initial values", anchor="w").pack(fill="x", padx=10, pady=(10, 10))
 
         if not app_data.parameter_names:
             ctk.CTkLabel(
@@ -955,16 +1031,9 @@ def create_ui():
         entries = {}
 
         for i, param_name in enumerate(app_data.parameter_names):
-            ctk.CTkLabel(
-                user_input_frame,
-                text=param_name,
-                anchor="w"
-            ).pack(fill="x", padx=10, pady=(5, 2))
+            ctk.CTkLabel(user_input_frame, text=param_name, anchor="w").pack(fill="x", padx=10, pady=(5, 2))
 
-            entry = ctk.CTkEntry(
-                master=user_input_frame,
-                placeholder_text=f"Initial value for {param_name}"
-            )
+            entry = ctk.CTkEntry(master=user_input_frame, placeholder_text=f"Initial value for {param_name}")
             entry.pack(fill="x", padx=10, pady=(0, 5))
 
             if i < len(app_data.initial_guess):
@@ -995,6 +1064,8 @@ def create_ui():
             app_data.batch_results = {}
             app_data.available_plot_keys = []
             app_data.selected_plot_key = None
+            app_data.batch_fit_rows = []
+            app_data.batch_report_df = None
 
             fsm.invalidate_downstream("get_init_vals")
             fsm.completed.discard("get_init_vals")
@@ -1004,17 +1075,13 @@ def create_ui():
             clear_tabs_from("get_init_vals")
             show_tab_text("Initial Values", format_init_vals_summary())
 
-        ctk.CTkButton(
-            master=user_input_frame,
-            text="Confirm Initial Values",
-            command=confirm_init_vals
-        ).pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkButton(master=user_input_frame, text="Confirm Initial Values", command=confirm_init_vals).pack(
+            fill="x", padx=10, pady=(10, 10)
+        )
 
-        ctk.CTkButton(
-            master=user_input_frame,
-            text="Back to Circuit Input",
-            command=show_circuit_prompt
-        ).pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(master=user_input_frame, text="Back to Circuit Input", command=show_circuit_prompt).pack(
+            fill="x", padx=10, pady=(0, 10)
+        )
 
         if app_data.batch_results:
             show_graph_selector()
@@ -1022,11 +1089,7 @@ def create_ui():
     def show_export_output_prompt():
         clear_frame(user_input_frame)
 
-        ctk.CTkLabel(
-            user_input_frame,
-            text="Output options",
-            anchor="w"
-        ).pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkLabel(user_input_frame, text="Output options", anchor="w").pack(fill="x", padx=10, pady=(10, 10))
 
         if app_data.batch_results:
             show_graph_selector()
@@ -1070,17 +1133,13 @@ def create_ui():
 
             show_tab_text("Output", format_output_summary(f"Saved to:\n{filepath}"))
 
-        ctk.CTkButton(
-            master=user_input_frame,
-            text="Export Output to Excel",
-            command=export_excel
-        ).pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(master=user_input_frame, text="Export Output to Excel", command=export_excel).pack(
+            fill="x", padx=10, pady=(0, 10)
+        )
 
-        ctk.CTkButton(
-            master=user_input_frame,
-            text="Back to Data Selectors",
-            command=show_file_and_selectors
-        ).pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(master=user_input_frame, text="Back to Data Selectors", command=show_file_and_selectors).pack(
+            fill="x", padx=10, pady=(0, 10)
+        )
 
     def on_resistivity_change(choice):
         if not app_data.result:
@@ -1098,6 +1157,8 @@ def create_ui():
             app_data.batch_results = {}
             app_data.available_plot_keys = []
             app_data.selected_plot_key = None
+            app_data.batch_fit_rows = []
+            app_data.batch_report_df = None
 
             invalidate_after_data_change()
             show_tab_text("Data", format_data_summary("All resistivities selected."))
@@ -1146,6 +1207,8 @@ def create_ui():
         app_data.batch_results = {}
         app_data.available_plot_keys = []
         app_data.selected_plot_key = None
+        app_data.batch_fit_rows = []
+        app_data.batch_report_df = None
 
         invalidate_after_data_change()
         show_tab_text("Data", format_data_summary())
@@ -1155,13 +1218,8 @@ def create_ui():
             return
 
         app_data.selected_material = choice
-
-        if choice == ALL_MATERIALS:
-            app_data.selected_resistivity = ALL_RESISTIVITIES
-            app_data.selected_data = None
-        else:
-            app_data.selected_resistivity = ALL_RESISTIVITIES
-            app_data.selected_data = None
+        app_data.selected_resistivity = ALL_RESISTIVITIES
+        app_data.selected_data = None
 
         app_data.circuit_formula = None
         app_data.parameter_names = []
@@ -1178,6 +1236,8 @@ def create_ui():
         app_data.batch_results = {}
         app_data.available_plot_keys = []
         app_data.selected_plot_key = None
+        app_data.batch_fit_rows = []
+        app_data.batch_report_df = None
 
         show_file_and_selectors()
         invalidate_after_data_change()
@@ -1207,6 +1267,8 @@ def create_ui():
                 "get_output": "Output",
                 "compute_all": "Fit",
                 "compare_graphs": "Fit",
+                "batch_fit_report": "Output",
+                "export_batch_report": "Output",
             }.get(step_name, "Output")
 
             show_tab_text(error_tab, f"{step_name} failed:\n{e}")
@@ -1240,12 +1302,8 @@ def create_ui():
 
         fig, ax = plt.subplots()
 
-        if len(selected_blocks) == 1:
-            material, resistivity, data = selected_blocks[0]
+        for material, resistivity, data in selected_blocks:
             generate_nyquist_graph(ax, data["Z_complex"], label=f"{material} | {resistivity}", fmt="-")
-        else:
-            for material, resistivity, data in selected_blocks:
-                generate_nyquist_graph(ax, data["Z_complex"], label=f"{material} | {resistivity}", fmt="-")
 
         ax.legend()
         plt.tight_layout()
@@ -1439,6 +1497,104 @@ def create_ui():
 
         show_tab_text("Fit", build_batch_summary() + "\n\nComparison graph displayed.")
 
+    def fit_all_eis_batch_step():
+        if app_data.result is None:
+            raise ValueError("No loaded file data found.")
+        if app_data.circuit_formula is None:
+            raise ValueError("No circuit formula available.")
+        if not app_data.initial_guess:
+            raise ValueError("No initial guess available.")
+
+        app_data.batch_fit_rows = []
+
+        fig, ax = plt.subplots(figsize=(14, 7))
+        ax.set_title("Compare Graphs")
+        ax.set_xlabel("Z' (Ohms)")
+        ax.set_ylabel("-Z'' (Ohms)")
+        ax.grid(True)
+
+        failures = []
+
+        for material, blocks in app_data.result.items():
+            for block in blocks:
+                try:
+                    resistivity = block["res"]
+                    freq = np.asarray(block["Frequency"], dtype=float)
+                    z_complex = np.asarray(block["Z_complex"], dtype=complex)
+
+                    circuit_obj = CustomCircuit(
+                        app_data.circuit_formula,
+                        initial_guess=app_data.initial_guess
+                    )
+
+                    try:
+                        circuit_obj.fit(freq, z_complex, weight_by_modulus=True)
+                    except TypeError:
+                        circuit_obj.fit(freq, z_complex)
+
+                    z_fit = np.asarray(circuit_obj.predict(freq), dtype=complex)
+                    fit_parameters = list(circuit_obj.parameters_)
+
+                    stats_dict = compute_fit_statistics(
+                        z_data=z_complex,
+                        z_fit=z_fit,
+                        n_params=len(fit_parameters)
+                    )
+
+                    append_batch_fit_result(
+                        batch_rows=app_data.batch_fit_rows,
+                        material=material,
+                        resistivity=resistivity,
+                        circuit_formula=app_data.circuit_formula,
+                        parameter_names=app_data.parameter_names,
+                        fit_parameters=fit_parameters,
+                        stats_dict=stats_dict
+                    )
+
+                    ax.plot(z_complex.real, -z_complex.imag, label=f"Data {material} | {resistivity}", lw=1.5)
+                    ax.plot(z_fit.real, -z_fit.imag, "--", label=f"Fit {material} | {resistivity}", lw=1.5)
+                except Exception as exc:
+                    failures.append(f"{material} | {block.get('res', 'unknown')}: {exc}")
+
+        ax.legend(fontsize=8, ncol=1)
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+
+        app_data.batch_report_df = build_batch_report_df(app_data.batch_fit_rows)
+
+        if app_data.batch_report_df.empty:
+            msg = "Batch fit finished, but no report rows were created."
+            if failures:
+                msg += "\n\nFailures:\n" + "\n".join(failures)
+            show_tab_text("Output", msg)
+            return
+
+        preview_text = app_data.batch_report_df.to_string(index=False)
+        if failures:
+            preview_text += "\n\nFailures:\n" + "\n".join(failures)
+
+        show_tab_text("Output", preview_text[:30000])
+
+    def export_batch_report_excel():
+        if app_data.batch_report_df is None or app_data.batch_report_df.empty:
+            show_tab_text("Output", "No batch report available to export.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save batch fit report",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+
+        if not filepath:
+            return
+
+        with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+            app_data.batch_report_df.to_excel(writer, sheet_name="batch_report", index=False)
+
+        show_tab_text("Output", f"Batch report saved to:\n{filepath}")
+
     button_defs = [
         ("Select Data", "select_data", select_data),
         ("Plot Nyquist", "plot_nyquist", plot_nyquist_step),
@@ -1448,6 +1604,8 @@ def create_ui():
         ("Get Output", "get_output", get_output_step),
         ("Compute All", "compute_all", compute_all_step),
         ("Compare Graphs", "compare_graphs", compare_graphs_step),
+        ("Batch Fit + Report", "batch_fit_report", fit_all_eis_batch_step),
+        ("Export Batch Report", "export_batch_report", export_batch_report_excel),
     ]
 
     for i, (label, step_name, action) in enumerate(button_defs):

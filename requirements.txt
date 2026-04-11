@@ -3,3 +3,4 @@ pandas
 customtkinter
 matplotlib
 impedance
+openpyxl
